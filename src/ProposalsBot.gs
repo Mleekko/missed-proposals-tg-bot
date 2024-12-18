@@ -1,26 +1,34 @@
 /**
  * Also create a file `secrets.gs` with your bot token:
- function getBotToken() {
- return '<the token>';
- }
+function getBotToken() {
+    return '<the token>';
+}
+function getWebAppUrl() {
+    return 'https://script.google.com/macros/s/...../exec';
+}
  */
 
-const botToken = getBotToken();  // add your bot Token
+/** API docs: https://core.telegram.org/bots/api#sendmessage
+ * */
+const BOT_TOKEN = getBotToken();     // add your bot Token
+const WEBAPP_URL = getWebAppUrl();  // add your script URL after the deployment
+
+const BOT_NAME = 'MissedProposalsBot'; // Telegram username
 const CHAT_ID = '-1002298175976';  // the real group
 const TEST_CHAT_ID = '-1002298175976'; // set to "-1" to simply log messages
 const initialStateVersion = '185041900'; // Starting point for this Spreadsheet
 
-var telegramUrl = "https://api.telegram.org/bot" + botToken;
+var telegramUrl = "https://api.telegram.org/bot" + BOT_TOKEN;
 
-
-const waitingTime = 300; // can be 1 or 5 minutes
+const POLL_INTERVAL = 5000;
+const waitingTime = 60; // can be 1 or 5 minutes
 const waitingTimeMs = waitingTime * 1000;
 
+const MESSAGES_TO_STORE = 100;
 
-const ss = SpreadsheetApp.getActiveSpreadsheet();
-//
 
 // Stores the last processed state version in cell A2, Max seen version in cell B2
+const ss = SpreadsheetApp.getActiveSpreadsheet();
 const [svCell, maxSvCell, messagesRange] = getStateVersionStorage();
 
 /* State version stuff */
@@ -32,7 +40,7 @@ function getStateVersionStorage() {
         sheet = ss.insertSheet('last_state_version');
         sheet.appendRow(['State Version', 'Max Seen Version']);
 
-        sheet.getRange("A9:F9").merge().setHorizontalAlignment('center').setValue("Last 100 messages");
+        sheet.getRange("A9:F9").merge().setHorizontalAlignment('center').setValue(`Last ${MESSAGES_TO_STORE} messages`);
         sheet.getRange("A10").setValue("Chat ID");
         sheet.getRange("B10").setValue("Message ID");
         sheet.getRange("C10").setValue("Validator");
@@ -41,7 +49,7 @@ function getStateVersionStorage() {
         sheet.getRange("F10").setValue("MissedCount");
     }
 
-    return [sheet.getRange("A2"), sheet.getRange("B2"), sheet.getRange("A11:F30")];
+    return [sheet.getRange("A2"), sheet.getRange("B2"), sheet.getRange("A11:F" + (11 + MESSAGES_TO_STORE - 1))];
 }
 
 function getLastStateVersion() {
@@ -66,17 +74,77 @@ function getMaxStateVersion() {
 
 function getPreviousMessages() {
     // Row is: [Chat ID, Message ID, Validator, Epoch, Round, MissedCount]
-    var data = messagesRange.getValues();
-    return data;
+    return messagesRange.getValues();
 }
 
 function savePreviousMessages(data) {
-    console.log(data);
     data.sort((a, b) => b[3] - a[3]); // sort by epoch descending
-    data = data.slice(0, 20)
-    console.log(data);
-
+    data = data.slice(0, MESSAGES_TO_STORE);
     messagesRange.setValues(data);
+}
+
+/* * */
+
+
+/* Track subscriptions in the spreadsheet */
+const sLock = LockService.getScriptLock();
+function getSubscriptionsSheet() {
+    let sheet = ss.getSheetByName('subscriptions');
+
+    // Create the sheet if it doesn't exist
+    if (!sheet) {
+        // ['Chat ID', 'Validator', 'User ID', 'Username']
+        sheet = ss.insertSheet('subscriptions');
+    }
+    return sheet;
+}
+
+function updateSubscriptions(callbackFn) { // callbackFn accepts data[][] and returns [data, updated]
+    const start = new Date().getTime();
+    sLock.waitLock(30000);
+    log("Waited for updateSubscriptions:" + (new Date().getTime() - start));
+    try {
+        let sheet = getSubscriptionsSheet();
+        let oldData = sheet.getDataRange().getValues();
+        // fix empty sheet
+        if (oldData.length === 1 && oldData[0].length !== 4) {
+            oldData = [];
+        }
+        const [data, updated] = callbackFn(oldData);
+        if (updated) {
+            sheet.clear();
+            if (data.length > 0) {
+                let range = sheet.getRange(1, 1, data.length, data[0].length);
+                range.setValues(data);
+            }
+        }
+    } finally {
+        sLock.releaseLock();
+    }
+}
+
+function getSubscriptions(validator) { // returns rows grouped by chat id
+    const start = new Date().getTime();
+    sLock.waitLock(30000);
+    log("Waited for getSubscriptions:" + (new Date().getTime() - start));
+    let subscriptions = {};
+    try {
+        let sheet = getSubscriptionsSheet();
+        const data = sheet.getDataRange().getValues();
+        for (const row of data) {
+            if (row[1] === 'all' || row[1] === validator) {
+                const chatId = row[0];
+                let chatSubs = subscriptions[String(chatId)];
+                if (!chatSubs){
+                    chatSubs = [];
+                }
+                chatSubs.push(row);
+            }
+        }
+    } finally {
+        sLock.releaseLock();
+    }
+    return subscriptions;
 }
 
 /* * */
@@ -187,8 +255,8 @@ function callGateway(path, payload) {
 /* Time util */
 function timeAgo(timestamp) {
     const diff = new Date().getTime() - timestamp;
-    if (diff < 2000) {
-        return "moments ago";
+    if (diff < 30000) {
+        return "";
     }
     const seconds = Math.floor(diff / 1000);
     if (seconds < 60) {
@@ -217,11 +285,233 @@ function isPlural(num) {
 /* * */
 
 
+/* Bot messaging - handleIncomingMessage() is executed as Telegram Webhook */
+const Command = {
+   HELP: 1,
+   SUBSCRIBE: 2,
+   UNSUBSCRIBE: 3,
+   UNKNOWN: 9,
+};
+const ALL = 'all';
+class IncomingMessage {
+    constructor(command, validators, message, sender, chatId, quote) {
+        this.command = command;
+        this.validators = validators; // array of strings
+        this.message = message;
+        this.sender = sender; // User object
+        this.chatId = chatId;
+        this.quote = quote;
+    }
+
+    static parse(message) {
+        const text = message.text;
+        const chatId = message.chat.id;
+        const parts = text.split(' ');
+        // command always comes first
+        const rawCommand = IncomingMessage.getRawCommand(parts[0]);
+        let command = IncomingMessage.getCommand(rawCommand);
+
+        let quote = null;
+        let validators = [];
+        let allValidators = rawCommand.endsWith('_all');
+        for (let i = 1; i < parts.length; i++) {
+            const validator = parts[i].toLowerCase();
+            if (validator.startsWith('validator_')) {
+                if (validators.indexOf(validator) === -1) {
+                    validators.push(validator);
+                }
+            } else if (validator === ALL) {
+                allValidators = true;
+                break;
+            } else {
+                command = Command.UNKNOWN;
+                quote = parts[i];
+                break;
+            }
+        }
+        if (allValidators) {
+            validators = ['all'];
+        }
+
+        return new IncomingMessage(command, validators, message, message.from, chatId, quote);
+    }
+
+    static getRawCommand(part) {
+        let commandCandidate = part.replaceAll('@' + BOT_NAME, '');
+        if (commandCandidate.startsWith('/')) {
+            commandCandidate = commandCandidate.substring(1);
+        }
+        return commandCandidate.toLowerCase();
+    }
+
+    static getCommand(rawCommand) {
+        switch (rawCommand) {
+            case 'start':
+            case 'help':
+            case 'h':
+                return Command.HELP;
+            case 'subscribe_all':
+            case 'subscribe':
+            case 'sub':
+            case 's':
+                return Command.SUBSCRIBE;
+            case 'unsubscribe_all':
+            case 'unsubscribe':
+            case 'uns':
+            case 'un':
+                return Command.UNSUBSCRIBE;
+            default:
+                return Command.UNKNOWN;
+        }
+    }
+}
+function handleIncomingMessage(e) {
+    try {
+        var contents = JSON.parse(e.postData.contents);
+        log("contents:");
+        log(contents);
+        if (contents.message && contents.message.text) { // ignore "added to group" messages
+            const message = IncomingMessage.parse(contents.message);
+            log(message);
+            const command = message.command;
+            switch (command) {
+                case Command.UNKNOWN:
+                    sendReplyMessage(message.message, message.quote, "Can't parse command. Please get /help");
+                    break;
+                case Command.HELP:
+                    let msg= "Available commands:"
+                    msg += "\nSubscribe to missed proposals for validator(s):";
+                    msg += "\n    /subscribe &lt;address(es)&gt; | all";
+                    msg += "\n    /subscribe_all";
+                    msg += "\n  I will @ you if you subscribe in a TG group, or DM if you subscribe to me directly.";
+                    msg += "\nTo unsubscribe <b>in this conversation</b> use:";
+                    // &lt; and &gt; can't be mixed with tags inside double-quoted strings for some reason!
+                    msg += "\n    /unsubscribe &lt;address(es)&gt; | all";
+                    msg += "\n    /unsubscribe_all";
+                    sendMessage(message.chatId, msg);
+                    break;
+                case Command.SUBSCRIBE:
+                    if (message.validators.length === 0) {
+                        respondTo(message.message, "Please specify validator addresses or `all`");
+                    } else {
+                        const subscribed = doSubscribe(message);
+                        if (subscribed.length) {
+                            respondTo(message.message, "Subscribed to validators: " + subscribed);
+                        } else {
+                            respondTo(message.message, "Already subscribed.");
+                        }
+                    }
+                    break;
+                case Command.UNSUBSCRIBE:
+                    if (message.validators.length === 0) {
+                        respondTo(message.message, "Please specify validator addresses or `all`");
+                    } else {
+                        const unsubscribed = doUnsubscribe(message);
+                        if (unsubscribed) {
+                            respondTo(message.message, "Unsubscribed from validators: " + message.validators);
+                        } else {
+                            respondTo(message.message, "Weren't subscribed.");
+                        }
+                    }
+                    break;
+            }
+        }
+    } catch(e){
+        log(e);
+    }
+}
+function doSubscribe(message) {
+    const chatId = message.chatId;
+    const userId = message.message.from.id;
+    const userName = message.message.from.username;
+    const validators = message.validators;
+
+    // ['Chat ID', 'Validator', 'User ID', 'Username']
+    updateSubscriptions((data) => {
+        let updated = false;
+        // 1. remove duplicates
+        for (let i = 0; i < data.length; i++) {
+            if (validators.length === 0) { // all validators were already present
+                break;
+            }
+            const row = data[i];
+            // noinspection EqualityComparisonWithCoercionJS
+            if (row[0] == chatId && row[2] == userId) {
+                if (validators[0] === 'all') { // change subscription to ALL validators
+                    if (row[1] === 'all') { // already subscribed
+                        validators.splice(0, 1);
+                    } else {
+                        updated = true;
+                        data.splice(i, 1); // remove sub for a specific validator
+                    }
+                } else {
+                    let validatorIdx = validators.indexOf(row[1]);
+                    if (validatorIdx > -1 || row[1] === 'all') {
+                        // already subscribed - remove from the list
+                        validators.splice(validatorIdx, 1);
+                    }
+                }
+            }
+        }
+
+        // 2. for all validators that were not in the list - add subscription(s)
+        for (const validator of validators) {
+            updated = true;
+            data.push([chatId, validator, userId, userName]);
+        }
+        return [data, updated];
+    });
+
+    return validators;
+}
+function doUnsubscribe(message) {
+    const chatId = message.chatId;
+    const userId = message.message.from.id;
+    const validators = message.validators;
+
+    let updated = false;
+    // ['Chat ID', 'Validator', 'User ID', 'Username']
+    updateSubscriptions((data) => {
+        for (let i = 0; i < data.length; i++) {
+            const row = data[i];
+            // noinspection EqualityComparisonWithCoercionJS
+            if (row[0] == chatId && row[2] == userId) {
+                if (validators[0] === 'all' || validators.indexOf(row[1]) > -1) { // remove ALL validators
+                    updated = true;
+                    data.splice(i, 1); // remove sub for a specific validator
+                }
+            }
+        }
+        return [data, updated];
+    });
+
+    return updated;
+}
+/* * */
+
+/* Logging inside the Google Appscript App is tricky */
+let logIdx = 1;
+let clearedLog = false;
+function log(message) {
+    let sheet = ss.getSheetByName('last_state_version');
+    if (!clearedLog) {
+        clearedLog = true;
+        sheet.getRange("I1:I100").setValue("");
+    }
+    let s = String(message);
+    if (s === '[object Object]') {
+        s = JSON.stringify(message);
+    }
+    sheet.getRange("I" + logIdx).setValue(s);
+    logIdx++;
+    Logger.info(message);
+    console.log(message);
+}
 /* * */
 
 // sends the message to Telegram APIs, OR just prints it if we are just testing with `doDebug()`.
 function sendTelegramMessage(url, data) {
-    if (data && data.payload && data.payload.chat_id == "-1") {
+    if (data && data.payload && String(data.payload.chat_id) === "-1") {
         Logger.info("sendTelegramMessage: " + JSON.stringify(data, null, 2));
         return -1;
     } else {
@@ -231,14 +521,35 @@ function sendTelegramMessage(url, data) {
     }
 }
 
-function sendMessage(chatId, text) {
-    var data = {
+// reply in groups, or just send a message in DMs
+function respondTo(original, text) {
+    if (original.chat.id === original.from.id) {
+        return sendMessage(original.chat.id, text);
+    } else {
+        return sendReplyMessage(original, null, text);
+    }
+}
+
+function sendReplyMessage(original, quote, text) {
+    const replyParams = {
+        message_id: String(original.message_id),
+        chat_id: String(original.chat.id)
+    };
+    if (quote) {
+        replyParams.quote = quote;
+    }
+    return sendMessage(original.chat.id, text, replyParams);
+}
+
+function sendMessage(chatId, text, replyParams) {
+    let data = {
         method: "post",
         payload: {
             method: "sendMessage",
-            chat_id: chatId,
+            chat_id: String(chatId), // have no idea why this is necessary
             text: text,
             parse_mode: "HTML",
+            reply_parameters: JSON.stringify(replyParams)
         }
     };
     return sendTelegramMessage('/sendMessage', data);
@@ -256,14 +567,6 @@ function editMessageText(chatId, messageId, text) {
         }
     };
     UrlFetchApp.fetch(telegramUrl + '/editMessageText', data);
-}
-
-function sendGroupMessage(text, isDebug) {
-    return sendMessage(isDebug ? TEST_CHAT_ID : CHAT_ID, text);
-}
-
-function sendChatMessage(chatId, text) {
-    return sendMessage(chatId, text);
 }
 
 /* * */
@@ -341,21 +644,38 @@ async function pollTransactions(isDebug, stateVersionOverride) {
     if (events.length) {
         let data = getPreviousMessages();
         for (const event of events) {
-            const chatId = isDebug ? TEST_CHAT_ID : CHAT_ID;
-            // Row is: [Chat ID, Message ID, Validator, Epoch, Round, MissedCount]
-            const previousMessage = data.find(row => row[0] == chatId && row[2] == event.validator && row[3] == event.epoch);
-            if (previousMessage) {
-                console.log("Found previous message:");
-                console.log(previousMessage);
-                previousMessage[5]++; // +1 missed proposal
-
-                const message = await formatMessage(event, previousMessage);
-                await editMessageText(chatId, previousMessage[1], message);
-            } else {
-                const message = await formatMessage(event);
-                const messageId = await sendGroupMessage(message, isDebug);
-                data.push([chatId, messageId, event.validator, event.epoch, event.round, 1]);
+            const mainChat = isDebug ? TEST_CHAT_ID : CHAT_ID;
+            let subscriptionsMap = getSubscriptions(event.validator);
+            if (!subscriptionsMap[mainChat]) {
+                subscriptionsMap[mainChat] = [];
             }
+            if (isDebug) { // do not send to other chats
+                const s = subscriptionsMap[mainChat];
+                subscriptionsMap = {};
+                subscriptionsMap[mainChat] = s;
+            }
+            for (const chatId in subscriptionsMap) {
+                console.log("Processing for chatId: " + chatId);
+                const usersToTag = getUsersToTag(subscriptionsMap[chatId]);
+                console.log(usersToTag);
+
+                // Row is: [Chat ID, Message ID, Validator, Epoch, Round, MissedCount]
+                // noinspection EqualityComparisonWithCoercionJS
+                const previousMessage = data.find(row => row[0] == chatId && row[2] == event.validator && row[3] == event.epoch);
+                if (previousMessage) {
+                    console.log("Found previous message:");
+                    console.log(previousMessage);
+                    previousMessage[5]++; // +1 missed proposal
+
+                    const message = await formatMessage(event, usersToTag, previousMessage);
+                    await editMessageText(chatId, previousMessage[1], message);
+                } else {
+                    const message = await formatMessage(event, usersToTag);
+                    const messageId = await sendMessage(chatId, message);
+                    data.push([chatId, messageId, event.validator, event.epoch, event.round, 1]);
+                }
+            }
+
         }
         savePreviousMessages(data);
     }
@@ -366,7 +686,21 @@ async function pollTransactions(isDebug, stateVersionOverride) {
     }
 }
 
-async function formatMessage(event, missData) {
+function getUsersToTag(subscriptions) {
+    const usersToTag = [];
+    if (subscriptions && subscriptions.length) {
+        for (const sub of subscriptions) {
+            if (sub[0] !== sub[2]) { // Group, not a DM
+                if (sub[3]) { // empty username - don't tag
+                    usersToTag.push('@' + sub[3]);
+                }
+            }
+        }
+    }
+    return usersToTag;
+}
+
+async function formatMessage(event, usersToTag, missData) {
     const missedCount = missData ? missData[5] : 1;
     var result = `<a href="https://validators.stakesafe.net/?validator=${event.validator}">${event.validatorName}</a> \n`;
     result += `missed ${pluralize(missedCount, ' proposal', ' proposals')} in Epoch ${event.epoch}`;
@@ -375,8 +709,13 @@ async function formatMessage(event, missData) {
     } else {
         result += ` Round ${event.round}\n`;
     }
-    result += `                    (${timeAgo(event.timestamp)})\n`;
-    // result += `    cc @Mleekko \n`;
+    const age = timeAgo(event.timestamp);
+    if (age) {
+        result += `                          (${age})\n`;
+    }
+    if (usersToTag.length) {
+        result += `    cc ${usersToTag.join(' ')} \n`;
+    }
     return result;
 }
 
@@ -385,13 +724,12 @@ async function processingLoop() {
     let startTime = new Date().getTime();
     // ScriptApp.newTrigger() can be scheduled to run at most every minute.
     // Perform 60 iterations with up to 5 sec delay to process transactions exactly every 5 seconds
-    const duration = 5000;
-    const iterations = waitingTimeMs / duration;
+    const iterations = waitingTimeMs / POLL_INTERVAL;
     for (let i = 1; i <= iterations; i++) {
         await pollTransactions(false);
         if (i !== iterations) {
             const versionsBehind = getMaxStateVersion() - getLastStateVersion();
-            const iterationEndTime = i * duration + startTime;
+            const iterationEndTime = i * POLL_INTERVAL + startTime;
             const sleepTime = iterationEndTime - new Date().getTime()
             console.log(`${i} => sleeping for: ${sleepTime}, behind ${versionsBehind} versions.`);
             if (sleepTime > 0) {
@@ -402,7 +740,7 @@ async function processingLoop() {
                     Utilities.sleep(sleepTime);
                 }
             } else {
-                const iterationsToSkip = Math.floor(-sleepTime / duration);
+                const iterationsToSkip = Math.floor(-sleepTime / POLL_INTERVAL);
                 if (iterationsToSkip > 0) {
                     i += iterationsToSkip;
                     console.log(`Skipped ${iterationsToSkip}. Next iteration: ${i + 1}`);
@@ -411,6 +749,9 @@ async function processingLoop() {
         }
     }
 }
+
+
+/******* Spreadsheet functions *******/
 
 /** Installs the trigger, so the `processingLoop()` will run every minute */
 function updateTriggers() {
@@ -428,9 +769,40 @@ function updateTriggers() {
         .everyMinutes(interval)
         .create();
 }
+/** Need to execute with an updated APP url after the deployment. (just once) */
+function updateWebhook() {
+    const response = UrlFetchApp.fetch(`${telegramUrl}/setWebhook?url=${WEBAPP_URL}`);
+    console.log(response.getContentText());
+}
 
-/* Execute from the App Script Editor to test if everything works */
-async function doDebug() {
+/** Webapp (Spreadsheet script) entry point */
+function doPost(request) {
+    handleIncomingMessage(request);
+}
+
+
+/** Execute from the App Script Editor to test if everything works */
+async function doDebugPoll() {
     await pollTransactions(true, 185062200);
+}
+/** Run to execute a test request and print the result into the console */
+function doDebugMessage() {
+    // Simulate a test request
+    const testMessage = {
+        message: {
+            chat: {
+                //   id: "-1" // pass "-1" to simply log the data, don't send anywhere
+                id: -1,// TEST_CHAT_ID,
+            },
+            text: "/help" // test command - modify if needed, e.g.: /subscribe all
+        }
+    };
+
+    // Call the doPast function with the test message to simulate bot interaction
+    return doPost({
+        postData: {
+            contents: JSON.stringify(testMessage)
+        }
+    });
 }
 
