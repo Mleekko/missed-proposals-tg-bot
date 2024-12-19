@@ -374,7 +374,6 @@ function handleIncomingMessage(e) {
         log(contents);
         if (contents.message && contents.message.text) { // ignore "added to group" messages
             const message = IncomingMessage.parse(contents.message);
-            log(message);
             const command = message.command;
             switch (command) {
                 case Command.UNKNOWN:
@@ -420,6 +419,7 @@ function handleIncomingMessage(e) {
         }
     } catch(e){
         log(e);
+        log("ERROR: " + e.getMessage());
     }
 }
 function doSubscribe(message) {
@@ -667,8 +667,6 @@ async function pollTransactions(isDebug, stateVersionOverride) {
                 // noinspection EqualityComparisonWithCoercionJS
                 const previousMessage = data.find(row => row[0] == chatId && row[2] == event.validator && row[3] == event.epoch);
                 if (previousMessage) {
-                    console.log("Found previous message:");
-                    console.log(previousMessage);
                     previousMessage[5]++; // +1 missed proposal
 
                     const message = await formatMessage(event, usersToTag, previousMessage);
@@ -735,7 +733,7 @@ async function processingLoop() {
             const versionsBehind = getMaxStateVersion() - getLastStateVersion();
             const iterationEndTime = i * POLL_INTERVAL + startTime;
             const sleepTime = iterationEndTime - new Date().getTime()
-            console.log(`${i} => sleeping for: ${sleepTime}, behind ${versionsBehind} versions.`);
+            console.log(`${i} => sleeping for: ${sleepTime}, lagging ${versionsBehind} versions behind.`);
             if (sleepTime > 0) {
                 if (versionsBehind > 100) { // don't sleep if we're behind
                     // do one more iteration
@@ -759,7 +757,6 @@ async function processingLoop() {
 
 /** Installs the trigger, so the `processingLoop()` will run every minute */
 function updateTriggers() {
-    console.log("Starting main loop");
     // Deletes all triggers in the current project.
     var triggers = ScriptApp.getProjectTriggers();
     for (var i = 0; i < triggers.length; i++) {
