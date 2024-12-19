@@ -134,9 +134,11 @@ function getSubscriptions(validator) { // returns rows grouped by chat id
         for (const row of data) {
             if (row[1] === 'all' || row[1] === validator) {
                 const chatId = row[0];
-                let chatSubs = subscriptions[String(chatId)];
+                let key = String(chatId);
+                let chatSubs = subscriptions[key];
                 if (!chatSubs){
                     chatSubs = [];
+                    subscriptions[key] = chatSubs;
                 }
                 chatSubs.push(row);
             }
@@ -479,6 +481,7 @@ function doUnsubscribe(message) {
                 if (validators[0] === 'all' || validators.indexOf(row[1]) > -1) { // remove ALL validators
                     updated = true;
                     data.splice(i, 1); // remove sub for a specific validator
+                    i--;
                 }
             }
         }
@@ -505,7 +508,6 @@ function log(message) {
     sheet.getRange("I" + logIdx).setValue(s);
     logIdx++;
     Logger.info(message);
-    console.log(message);
 }
 /* * */
 
@@ -646,6 +648,8 @@ async function pollTransactions(isDebug, stateVersionOverride) {
         for (const event of events) {
             const mainChat = isDebug ? TEST_CHAT_ID : CHAT_ID;
             let subscriptionsMap = getSubscriptions(event.validator);
+            console.log("subscriptionsMap");
+            console.log(subscriptionsMap);
             if (!subscriptionsMap[mainChat]) {
                 subscriptionsMap[mainChat] = [];
             }
@@ -784,6 +788,10 @@ function doPost(request) {
 /** Execute from the App Script Editor to test if everything works */
 async function doDebugPoll() {
     await pollTransactions(true, 185062200);
+}
+function doDebugSubscriptions() {
+    let subscriptions = getSubscriptions('validator_rdx1s07zllgtzvy9xfyj34jfa9qpd004tcqg80c6vjezv5xmvk0d7jvcjm');
+    console.log(subscriptions);
 }
 /** Run to execute a test request and print the result into the console */
 function doDebugMessage() {
